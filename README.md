@@ -106,15 +106,3 @@ agent/
   critic.py         # Async critic for code feedback
   prompts/          # System, mutation, crossover, EDA prompts
 ```
-
-## Results (stanford-covid-vaccine, 3h)
-
-| Metric | Value |
-|---|---|
-| Best MCRMSE | 0.222 |
-| Percentile Rank | **100%** (gold medal) |
-| Iterations | 14 |
-
-## Reference
-
-AIRA2 paper: https://arxiv.org/abs/2603.26499
