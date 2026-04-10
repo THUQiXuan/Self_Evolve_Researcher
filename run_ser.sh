@@ -80,12 +80,14 @@ do_run() {
     local background=false
     local num_instances=4
     local time_limit=10800  # 3 hours
+    local gpus_arg=""        # e.g. "2,3,6,7"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --background) background=true; shift ;;
             --instances) num_instances="$2"; shift 2 ;;
             --time-limit) time_limit="$2"; shift 2 ;;
+            --gpus) gpus_arg="$2"; shift 2 ;;
             *) log "Unknown option: $1"; shift ;;
         esac
     done
@@ -100,9 +102,13 @@ do_run() {
 
     mkdir -p "$WORKSPACE_DIR/$competition"
 
-    # Free GPUs: GPU 0,1 are mostly free (0,1 have 3306MB used each)
-    # Assign one GPU per instance
-    local available_gpus=(0 1 4 5)  # GPUs with most free memory
+    # Build GPU list: --gpus "2,3,6,7" overrides default
+    local available_gpus
+    if [[ -n "$gpus_arg" ]]; then
+        IFS=',' read -ra available_gpus <<< "$gpus_arg"
+    else
+        available_gpus=(2 3 6 7)  # default: GPUs free on this server
+    fi
     local pid_file="$WORKSPACE_DIR/$competition/.pids"
     > "$pid_file"
 
