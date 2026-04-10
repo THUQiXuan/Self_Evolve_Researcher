@@ -1,6 +1,6 @@
-"""SER — Langfuse tracing singleton.
+"""SER — Langfuse tracing singleton (Langfuse SDK v3/v4 compatible).
 
-All other modules import `get_langfuse()` and `get_trace_context()` from here.
+All other modules import `get_langfuse()` from here.
 Set environment variables before running:
     SER_LANGFUSE_PUBLIC_KEY
     SER_LANGFUSE_SECRET_KEY
@@ -56,43 +56,50 @@ def is_enabled() -> bool:
 
 
 class RunTrace:
-    """One trace per competition run (shared across all instances via trace_id)."""
+    """One trace per competition run."""
 
     def __init__(self, competition_id: str, instance_id: int, time_limit: int):
         self.competition_id = competition_id
         self.instance_id = instance_id
-        self._trace = None
-        self._current_span = None
+        self._trace_id: Optional[str] = None
+        self._root_span = None
 
         lf = get_langfuse()
         if lf is None:
             return
 
         try:
-            self._trace = lf.trace(
-                name=f"ser-run",
+            from langfuse.types import TraceContext
+            # Create a fresh trace id
+            self._trace_id = lf.create_trace_id()
+            # Open a root span that owns the trace
+            self._root_span = lf.start_observation(
+                trace_context=TraceContext(trace_id=self._trace_id),
+                name="ser-run",
+                as_type="span",
                 input={"competition": competition_id, "instance": instance_id,
                        "time_limit": time_limit},
-                tags=[competition_id, f"inst-{instance_id}"],
                 metadata={"competition": competition_id, "instance_id": instance_id},
             )
-            logger.info(f"Langfuse trace created: {self._trace.id}")
+            logger.info(f"Langfuse trace created: {self._trace_id}")
         except Exception as e:
             logger.warning(f"Langfuse trace creation failed: {e}")
+            self._trace_id = None
+            self._root_span = None
 
     @property
     def trace_id(self) -> Optional[str]:
-        return self._trace.id if self._trace else None
+        return self._trace_id
 
     def start_iteration(self, iteration: int, operation: str,
-                        parent_scores: list[float]) -> "IterationSpan":
-        return IterationSpan(self._trace, iteration, operation, parent_scores)
+                        parent_scores: list) -> "IterationSpan":
+        return IterationSpan(self._root_span, iteration, operation, parent_scores)
 
     def end(self, result: dict):
-        if self._trace is None:
+        if self._root_span is None:
             return
         try:
-            self._trace.update(
+            self._root_span.update(
                 output=result,
                 metadata={
                     "total_iterations": result.get("total_iterations"),
@@ -100,6 +107,7 @@ class RunTrace:
                     "percentile_rank": result.get("percentile_rank"),
                 },
             )
+            self._root_span.end()
             lf = get_langfuse()
             if lf:
                 lf.flush()
@@ -110,17 +118,17 @@ class RunTrace:
 class IterationSpan:
     """One span per evolutionary iteration."""
 
-    def __init__(self, trace, iteration: int, operation: str, parent_scores: list[float]):
+    def __init__(self, parent_span, iteration: int, operation: str, parent_scores: list):
         self._span = None
-        self._trace = trace
         self.operation = operation
         self.iteration = iteration
 
-        if trace is None:
+        if parent_span is None:
             return
         try:
-            self._span = trace.span(
+            self._span = parent_span.start_observation(
                 name=f"iter-{iteration:03d}-{operation}",
+                as_type="span",
                 input={"operation": operation, "parent_scores": parent_scores},
                 metadata={"iteration": iteration, "operation": operation},
             )
@@ -135,10 +143,11 @@ class IterationSpan:
         if self._span is None:
             return
         try:
-            self._span.end(
+            self._span.update(
                 output={"score": score, "percentile_rank": percentile,
                         "steps": steps, "elapsed_s": round(elapsed, 1)},
             )
+            self._span.end()
         except Exception as e:
             logger.warning(f"Langfuse iteration span end failed: {e}")
 
@@ -152,8 +161,9 @@ class StepSpan:
         if parent_span is None:
             return
         try:
-            self._span = parent_span.span(
+            self._span = parent_span.start_observation(
                 name=f"step-{step:02d}",
+                as_type="span",
                 input={"reason": reason[:500] if reason else ""},
                 metadata={"step": step},
             )
@@ -164,12 +174,13 @@ class StepSpan:
         if self._span is None:
             return
         try:
-            self._span.end(
+            self._span.update(
                 output={
                     "action_type": action_type,
                     "action": action_content[:300] if action_content else "",
                     "observation": observation[:500] if observation else "",
                 },
             )
+            self._span.end()
         except Exception as e:
             logger.warning(f"Langfuse step span end failed: {e}")

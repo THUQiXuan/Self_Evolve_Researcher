@@ -110,23 +110,24 @@ class LLMClient:
                 try:
                     lf = get_langfuse()
                     if lf is not None:
+                        from langfuse.types import TraceContext
                         prompt_text = (system or "") + "\n".join(
                             m.get("content", "") if isinstance(m.get("content"), str)
                             else str(m.get("content", ""))
                             for m in messages
                         )
-                        gen_kwargs = dict(
+                        tc = TraceContext(trace_id=self.trace_id) if self.trace_id else None
+                        gen = lf.start_observation(
+                            trace_context=tc,
                             name="llm-call",
+                            as_type="generation",
                             model=self.model,
                             input=prompt_text[:5000],
-                            output=text[:2000],
-                            usage={"input": input_tokens, "output": output_tokens,
-                                   "total": input_tokens + output_tokens},
-                            latency=time.time() - t0,
+                            usage_details={"input": input_tokens, "output": output_tokens,
+                                           "total": input_tokens + output_tokens},
                         )
-                        if self.trace_id:
-                            gen_kwargs["trace_id"] = self.trace_id
-                        lf.generation(**gen_kwargs)
+                        gen.update(output=text[:2000])
+                        gen.end()
                 except Exception:
                     pass  # Never let tracing crash the LLM call
 
