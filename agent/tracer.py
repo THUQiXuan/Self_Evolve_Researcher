@@ -70,9 +70,23 @@ class RunTrace:
 
         try:
             from langfuse.types import TraceContext
-            # Create a fresh trace id
+            import time as _time
+
+            # Create trace id
             self._trace_id = lf.create_trace_id()
-            # Open a root span that owns the trace
+
+            # Immediately register the trace with correct name/tags via ingestion API
+            # (the root span won't flush until 3h later, so we pre-register here)
+            self._ingest_trace_create(
+                trace_id=self._trace_id,
+                name="ser-run",
+                input={"competition": competition_id, "instance": instance_id,
+                       "time_limit": time_limit},
+                tags=[competition_id, f"inst-{instance_id}"],
+                metadata={"competition": competition_id, "instance_id": instance_id},
+            )
+
+            # Open a root span — used as parent for iteration spans
             self._root_span = lf.start_observation(
                 trace_context=TraceContext(trace_id=self._trace_id),
                 name="ser-run",
@@ -87,6 +101,41 @@ class RunTrace:
             self._trace_id = None
             self._root_span = None
 
+    def _ingest_trace_create(self, trace_id: str, name: str, input: dict,
+                              tags: list, metadata: dict):
+        """Send a trace-create event directly via ingestion API so the trace
+        name/tags are visible immediately (before root span flushes)."""
+        try:
+            import urllib.request as _ur
+            import json as _json
+            import base64 as _b64
+            import os as _os
+            from datetime import datetime, timezone
+
+            pk = _os.environ.get("SER_LANGFUSE_PUBLIC_KEY", "")
+            sk = _os.environ.get("SER_LANGFUSE_SECRET_KEY", "")
+            host = _os.environ.get("SER_LANGFUSE_HOST", "https://cloud.langfuse.com")
+            creds = _b64.b64encode(f"{pk}:{sk}".encode()).decode()
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            payload = {"batch": [{
+                "id": f"tc-{trace_id}",
+                "type": "trace-create",
+                "body": {"id": trace_id, "name": name, "input": input,
+                         "tags": tags, "metadata": metadata},
+                "timestamp": ts,
+            }]}
+            req = _ur.Request(
+                f"{host}/api/public/ingestion",
+                _json.dumps(payload).encode(),
+            )
+            req.add_header("Content-Type", "application/json")
+            req.add_header("Authorization", f"Basic {creds}")
+            with _ur.urlopen(req, timeout=10) as r:
+                r.read()
+        except Exception as e:
+            logger.debug(f"trace pre-register failed (non-fatal): {e}")
+
     @property
     def trace_id(self) -> Optional[str]:
         return self._trace_id
@@ -96,18 +145,23 @@ class RunTrace:
         return IterationSpan(self._root_span, iteration, operation, parent_scores)
 
     def end(self, result: dict):
-        if self._root_span is None:
-            return
         try:
-            self._root_span.update(
-                output=result,
-                metadata={
-                    "total_iterations": result.get("total_iterations"),
-                    "best_score": result.get("best_full_score"),
-                    "percentile_rank": result.get("percentile_rank"),
-                },
-            )
-            self._root_span.end()
+            if self._root_span is not None:
+                self._root_span.update(output=result)
+                self._root_span.end()
+            # Also push final output to trace header via ingestion API
+            if self._trace_id:
+                self._ingest_trace_create(
+                    trace_id=self._trace_id,
+                    name="ser-run",
+                    input={},
+                    tags=[self.competition_id, f"inst-{self.instance_id}"],
+                    metadata={
+                        "total_iterations": result.get("total_iterations"),
+                        "best_score": result.get("best_full_score"),
+                        "percentile_rank": result.get("percentile_rank"),
+                    },
+                )
             lf = get_langfuse()
             if lf:
                 lf.flush()
