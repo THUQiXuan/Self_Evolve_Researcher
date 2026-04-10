@@ -27,6 +27,7 @@ from prompts.crossover import build_crossover_prompt
 from prompts.planning import build_planning_prompt
 from eda_agent import run_eda
 from critic import run_critic
+from tracer import init_langfuse, RunTrace
 
 logger = logging.getLogger(__name__)
 
@@ -82,11 +83,20 @@ class Orchestrator:
         self._pending_critic = None
         self._last_critic_summary = ""
 
+        # Langfuse tracing
+        init_langfuse()
+        self._run_trace: Optional[RunTrace] = None
+
     def run(self) -> dict:
         """Run the full evolutionary search loop."""
         self.start_time = time.time()
         logger.info(f"=== Starting SER for {self.competition_id} "
                     f"(instance={self.instance_id}, gpu={self.gpu_id}, limit={self.time_limit}s) ===")
+
+        # Create Langfuse trace for this run; propagate trace_id to LLM client
+        self._run_trace = RunTrace(self.competition_id, self.instance_id, self.time_limit)
+        if self._run_trace.trace_id:
+            self.llm.trace_id = self._run_trace.trace_id
 
         # Step 1: Load pre-split HCE data (must be prepared by presplit_all.py)
         hce_dir = self.work_dir / "hce"
@@ -335,10 +345,15 @@ class Orchestrator:
             time_note = f"\n\n**Time budget: {int(remaining/60)} minutes remaining.** Keep training fast.\n"
             task_prompt += time_note
 
+            # Langfuse iteration span
+            parent_scores = [p.search_score for p in parents if p.search_score is not None]
+            iter_span = self._run_trace.start_iteration(self.iteration, operation, parent_scores)
+
             try:
-                result = agent.run(system_prompt, task_prompt)
+                result = agent.run(system_prompt, task_prompt, iter_span=iter_span)
             except Exception as e:
                 logger.error(f"Iteration {self.iteration} crashed: {e}")
+                iter_span.end(score=None, percentile=None, steps=0, elapsed=0)
                 continue
             finally:
                 # Clean up this iteration's tmp dir to free disk space
@@ -463,6 +478,12 @@ class Orchestrator:
                         f"parents=[{','.join(p.id for p in parents)}] steps={result['steps']} "
                         f"elapsed={result['elapsed']:.0f}s pop={self.db.size()}")
 
+            # End Langfuse iteration span
+            iter_span.end(
+                score=full_score, percentile=percentile,
+                steps=result["steps"], elapsed=result["elapsed"],
+            )
+
             # Save intermediate result.json (so kill doesn't lose progress)
             self._save_intermediate_result()
 
@@ -506,6 +527,10 @@ class Orchestrator:
             result["best_val_score"] = None
             result["percentile_rank"] = -1.0
             logger.warning(f"No successful solutions for {self.competition_id}")
+
+        # End Langfuse run trace
+        if self._run_trace:
+            self._run_trace.end(result)
 
         return result
 

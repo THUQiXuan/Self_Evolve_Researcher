@@ -108,7 +108,7 @@ class ReActAgent:
             except OSError as e:
                 logger.warning(f"Failed to chown {self.work_dir} to {AGENT_USER}: {e}")
 
-    def run(self, system_prompt: str, task_prompt: str) -> dict:
+    def run(self, system_prompt: str, task_prompt: str, iter_span=None) -> dict:
         """
         Run the ReAct loop.
 
@@ -165,6 +165,9 @@ class ReActAgent:
             if reason:
                 logger.info(f"  Reason: {reason[:300]}")
 
+            # Start Langfuse step span
+            step_span = iter_span.start_react_step(step, reason or "") if iter_span else None
+
             if action_type is None:
                 # No action found — ask LLM to produce one
                 messages.append({"role": "assistant", "content": response})
@@ -173,6 +176,8 @@ class ReActAgent:
                     "content": "Please provide an action. Use one of: bash(command), python(code), or submit(path)."
                 })
                 trajectory.append((reason, "none", "No action parsed"))
+                if step_span:
+                    step_span.end("none", "", "No action parsed")
                 continue
 
             logger.info(f"  Action: {action_type}({action_content[:200]})")
@@ -204,6 +209,8 @@ class ReActAgent:
                             best_submission_path = submission_path
                             best_eval_score = score
                             best_is_lower = is_lower
+                    if step_span:
+                        step_span.end("submit", action_content, observation)
                     trajectory.append((reason, f"submit({action_content})", observation))
                     messages.append({"role": "assistant", "content": response})
                     messages.append({"role": "user", "content": f"Observation:\n{observation}"})
@@ -212,6 +219,8 @@ class ReActAgent:
                 else:
                     # No eval scorer or file missing: original behaviour (end loop)
                     observation = self._handle_submit(submission_path)
+                    if step_span:
+                        step_span.end("submit", action_content, observation)
                     trajectory.append((reason, f"submit({action_content})", observation))
                     messages.append({"role": "assistant", "content": response})
                     messages.append({"role": "user", "content": f"Observation:\n{observation}"})
@@ -229,6 +238,8 @@ class ReActAgent:
                 observation = f"Unknown action type: {action_type}"
 
             observation = truncate_output(observation)
+            if step_span:
+                step_span.end(action_type, action_content, observation)
             trajectory.append((reason, f"{action_type}({action_content[:200]})", observation[:2000]))
 
             # Feed observation back

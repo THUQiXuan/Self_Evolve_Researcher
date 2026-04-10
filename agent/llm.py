@@ -8,6 +8,7 @@ import urllib.error
 from typing import Optional
 
 from config import LLM_PROXY_URL, LLM_API_KEY, LLM_MODEL, LLM_MAX_TOKENS, LLM_TEMPERATURE
+from tracer import get_langfuse
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,7 @@ class LLMClient:
         base_url: str = LLM_PROXY_URL,
         api_key: str = LLM_API_KEY,
         max_retries: int = 8,
+        trace_id: Optional[str] = None,
     ):
         self.model = model
         self.base_url = base_url.rstrip("/")
@@ -28,6 +30,8 @@ class LLMClient:
         self.max_retries = max_retries
         self.total_input_tokens = 0
         self.total_output_tokens = 0
+        # Langfuse trace id — set by orchestrator so all generations belong to the same trace
+        self.trace_id = trace_id
 
     def chat(
         self,
@@ -79,6 +83,7 @@ class LLMClient:
         data = json.dumps(payload).encode()
 
         for attempt in range(self.max_retries):
+            t0 = time.time()
             try:
                 req = urllib.request.Request(url, data=data)
                 req.add_header("Content-Type", "application/json")
@@ -96,8 +101,34 @@ class LLMClient:
 
                 # Token usage (best-effort)
                 usage = result.get("usageMetadata", {})
-                self.total_input_tokens += usage.get("promptTokenCount", 0)
-                self.total_output_tokens += usage.get("candidatesTokenCount", 0)
+                input_tokens = usage.get("promptTokenCount", 0)
+                output_tokens = usage.get("candidatesTokenCount", 0)
+                self.total_input_tokens += input_tokens
+                self.total_output_tokens += output_tokens
+
+                # Langfuse generation logging (best-effort, never breaks the call)
+                try:
+                    lf = get_langfuse()
+                    if lf is not None:
+                        prompt_text = (system or "") + "\n".join(
+                            m.get("content", "") if isinstance(m.get("content"), str)
+                            else str(m.get("content", ""))
+                            for m in messages
+                        )
+                        gen_kwargs = dict(
+                            name="llm-call",
+                            model=self.model,
+                            input=prompt_text[:5000],
+                            output=text[:2000],
+                            usage={"input": input_tokens, "output": output_tokens,
+                                   "total": input_tokens + output_tokens},
+                            latency=time.time() - t0,
+                        )
+                        if self.trace_id:
+                            gen_kwargs["trace_id"] = self.trace_id
+                        lf.generation(**gen_kwargs)
+                except Exception:
+                    pass  # Never let tracing crash the LLM call
 
                 return text
 
